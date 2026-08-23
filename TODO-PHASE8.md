@@ -6,6 +6,12 @@ security headers, rate limiting, resilience (circuit breaker + retry),
 scalable sessions (Redis store), observability (correlation id + latency
 logging), and run configuration docs.
 
+> **Audit note (2026-08-22):** confirmed still open — no `nginx -t` ever run
+> inside a live container, no multi-instance BFF + shared-Redis-session load
+> test, and no Prometheus `/metrics` endpoint anywhere in the codebase
+> (grepped `prom-client`/`promhttp` across all services, zero hits). Tracked
+> centrally in `TODO.md`'s "Known Gaps — Audit Summary" section.
+
 ## What changed (main-node-service)
 
 - **[NEW] `src/security/security.middleware.ts`** — global middleware that:

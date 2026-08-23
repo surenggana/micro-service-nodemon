@@ -4,6 +4,13 @@ The microservice stack is fully scaffolded, all six services build, and the
 monolith-to-Postgres data path is tooled. Remaining work is the live cutover
 (needs Docker running + a maintenance window).
 
+> **Audit note (2026-08-22):** the "Live" checklist below is superseded by
+> `TODO-PHASE12.md` (live cutover actually ran there). Real remaining gaps —
+> shadow traffic never attempted, `db_payment` ETL still loads 0 rows, and
+> monolith-removal status being unverifiable from this repo — are tracked in
+> `TODO.md`'s "Known Gaps — Audit Summary" section; see that instead of this
+> file's stale unchecked items below.
+
 ## Done & verified
 
 ### 1. All 6 services build cleanly

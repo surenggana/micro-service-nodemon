@@ -14,6 +14,8 @@ export interface VoucherType {
   maxPerOrder: number;
   userType: string;
   active: boolean;
+  /** Remaining sellable units. `null` = unlimited. */
+  stock: number | null;
   createdAt: string;
 }
 
@@ -40,6 +42,7 @@ export class VoucherTypeService {
       maxPerOrder: e.maxPerOrder || 10,
       userType: e.userType || 'up',
       active: e.active !== false,
+      stock: e.stock === undefined ? null : e.stock,
       createdAt: e.createdAt,
     };
   }
@@ -84,6 +87,7 @@ export class VoucherTypeService {
         maxPerOrder: Number(data.maxPerOrder) || 10,
         userType: data.userType || 'up',
         active: data.active !== false,
+        stock: data.stock === undefined || data.stock === null ? null : Number(data.stock),
         createdAt: data.createdAt || new Date().toISOString(),
       });
     } else {
@@ -96,6 +100,7 @@ export class VoucherTypeService {
       if (data.maxPerOrder !== undefined) entity.maxPerOrder = Number(data.maxPerOrder) || 10;
       if (data.userType !== undefined) entity.userType = data.userType;
       if (data.active !== undefined) entity.active = data.active;
+      if (data.stock !== undefined) entity.stock = data.stock === null ? null : Number(data.stock);
     }
     const saved = await this.vtRepo.save(entity);
     return this.toModel(saved);

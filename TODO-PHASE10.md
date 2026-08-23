@@ -6,7 +6,8 @@ before this phase) is already wired end-to-end across the stack; this phase
 **proves** it compiles and runs, then cleans up.
 
 ## Steps
-- [ ] 1. Build verification — all 6 services compile with the sessions feature:
+- [x] 1. Build verification — all 6 services compile with the sessions feature
+      *(parent checkbox was stale — all 6 sub-items below were already [x]; audit 2026-08-22)*:
       - [x] `mikrotik-go-service`: `go build ./...` + `go vet ./...`
       - [x] `erp-node-service`: `npm run build`
       - [x] `main-node-service`: `npm run build`

@@ -36,6 +36,10 @@ export class VoucherTypeEntity {
   @Column({ type: 'boolean', default: true })
   active: boolean;
 
+  /** Remaining sellable units. `null` = unlimited (no stock tracking). */
+  @Column({ type: 'int', nullable: true, default: null })
+  stock: number | null;
+
   @CreateDateColumn()
   createdAt: string;
 }
