@@ -14,14 +14,8 @@ import { BillingService } from './billing.service';
 import { MikrotikGrpcClient } from '../clients/mikrotik-grpc.client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RequirePermission } from '../auth/permissions.decorator';
+import { RedisPublisherService } from '../redis/redis-publisher.service';
 
-/**
- * Billing admin endpoints: `/api/billing/:session/*`.
- *
- * Every entity mutation/read that starts from an id is checked against the
- * route session before it is allowed to proceed. This is important because
- * IDs are UUIDs but are not themselves tenant/session boundaries.
- */
 @Controller('billing/:session')
 @UseGuards(JwtAuthGuard)
 @RequirePermission('manageBilling')
@@ -29,10 +23,28 @@ export class BillingController {
   constructor(
     private readonly billingService: BillingService,
     private readonly mikrotikGrpc: MikrotikGrpcClient,
+    private readonly redis: RedisPublisherService,
   ) {}
 
   private sessionMatches(entity: { sessionId?: string } | null | undefined, session: string): boolean {
     return !!entity && entity.sessionId === session;
+  }
+
+  private buildReminderPayload(
+    invoice: { id: string; customerId: string; customerName?: string; amount?: number; dueDate?: string },
+    customer: { sessionId: string; name?: string; telegramId?: string },
+  ) {
+    const daysLeft = this.billingService.getDaysUntilDue(invoice.dueDate);
+    return {
+      invoiceId: invoice.id,
+      customerId: invoice.customerId,
+      sessionId: customer.sessionId,
+      customerName: customer.name || invoice.customerName || '',
+      telegramId: customer.telegramId || '',
+      amount: Number(invoice.amount || 0),
+      dueDate: invoice.dueDate || '',
+      daysLeft,
+    };
   }
 
   @Get('stats')
@@ -53,7 +65,6 @@ export class BillingController {
 
   @Post('customers')
   createCustomer(@Param('session') session: string, @Body() body: any) {
-    // Never trust a client-supplied sessionId.
     return this.billingService.saveCustomer({ ...body, sessionId: session, id: undefined });
   }
 
@@ -61,7 +72,6 @@ export class BillingController {
   async updateCustomer(@Param('session') session: string, @Param('id') id: string, @Body() body: any) {
     const existing = await this.billingService.getCustomer(id);
     if (!this.sessionMatches(existing, session)) return { error: 'Not found' };
-    // Never allow the request body to move a customer into another session.
     return this.billingService.saveCustomer({ ...body, id, sessionId: session });
   }
 
@@ -92,8 +102,33 @@ export class BillingController {
   ) {
     const inv = await this.billingService.getInvoice(id);
     if (!this.sessionMatches(inv, session)) return { error: 'Invoice not found' };
-    const paid = await this.billingService.payInvoice(id, body.paidBy || 'Admin', body.note);
-    return paid ? { success: true, invoice: paid } : { error: 'Not found' };
+    const collectorName = String(body?.paidBy || 'Admin').trim();
+    if (!collectorName) return { error: 'paidBy wajib diisi' };
+    const paid = await this.billingService.payInvoice(id, collectorName, body?.note);
+    if (!paid) return { error: 'Not found' };
+
+    let reenabled = false;
+    const customer = await this.billingService.getCustomer(paid.customerId);
+    if (customer && customer.sessionId === session && customer.status === 'suspended' && customer.autoDisable !== false) {
+      if (customer.mikrotikUser) {
+        const routerResult = customer.type === 'pppoe'
+          ? await this.mikrotikGrpc.enablePppSecret(session, customer.mikrotikUser)
+          : await this.mikrotikGrpc.enableHotspotUser(session, customer.mikrotikUser);
+        if (!routerResult.success) {
+          return {
+            success: true,
+            invoice: paid,
+            reenabled: false,
+            reenableError: routerResult.error || 'Gagal mengaktifkan kembali akses di router',
+          };
+        }
+      }
+      customer.status = 'active';
+      await this.billingService.saveCustomer(customer);
+      reenabled = true;
+    }
+
+    return { success: true, invoice: paid, reenabled };
   }
 
   @Post('invoices/manual')
@@ -101,7 +136,9 @@ export class BillingController {
     @Param('session') session: string,
     @Body() body: { customerId: string; period?: string; dueDate?: string },
   ) {
-    const cust = await this.billingService.getCustomer(body.customerId);
+    const customerId = String(body?.customerId || '').trim();
+    if (!customerId) return { error: 'customerId wajib diisi' };
+    const cust = await this.billingService.getCustomer(customerId);
     if (!this.sessionMatches(cust, session)) return { error: 'Customer not found' };
     return this.billingService.createInvoice(cust!, body.period, body.dueDate);
   }
@@ -110,12 +147,25 @@ export class BillingController {
   async sendReminder(@Param('session') session: string, @Param('id') id: string) {
     const inv = await this.billingService.getInvoice(id);
     if (!this.sessionMatches(inv, session)) return { error: 'Invoice not found' };
+    if (inv!.status === 'paid' || inv!.status === 'cancelled') {
+      return { error: 'Invoice sudah tidak dapat dikirimkan sebagai tagihan aktif' };
+    }
     const cust = await this.billingService.getCustomer(inv!.customerId);
     if (!this.sessionMatches(cust, session)) return { error: 'Invoice not found' };
     if (!cust?.telegramId) return { error: 'Pelanggan tidak memiliki Telegram ID' };
-    const daysLeft = this.billingService.getDaysUntilDue(inv!.dueDate);
+
+    const payload = this.buildReminderPayload(inv!, cust);
+    const published = await this.redis.publish('billing.invoice.reminder', payload);
+    if (!published) {
+      return { success: false, error: 'Gagal mengantrikan reminder Telegram' };
+    }
+
     await this.billingService.markReminderSent(id);
-    return { success: true, message: `Reminder sent to ${cust.name} (${daysLeft} days left)` };
+    return {
+      success: true,
+      queued: true,
+      message: `Reminder queued for ${cust.name} (${payload.daysLeft} days left)`,
+    };
   }
 
   @Post('run-overdue')
@@ -175,12 +225,64 @@ export class BillingController {
   }
 
   @Get('import-users/:type')
-  async importUsers() {
-    return {
-      success: true,
-      users: [],
-      message: 'Router import requires the router connection (Go service). No users imported.',
-    };
+  async importUsers(@Param('session') session: string, @Param('type') type: string) {
+    const normalizedType = String(type || '').trim().toLowerCase();
+    if (!['hotspot', 'pppoe'].includes(normalizedType)) {
+      return { success: false, users: [], message: 'type harus hotspot atau pppoe' };
+    }
+    if (!session) return { success: false, users: [], message: 'session wajib diisi' };
+
+    try {
+      const users = normalizedType === 'pppoe'
+        ? await this.mikrotikGrpc.listPppSecrets(session)
+        : await this.mikrotikGrpc.listHotspotUsers(session);
+
+      const existing = await this.billingService.loadCustomers(session);
+      const byUser = new Map(
+        existing
+          .filter((customer) => customer.mikrotikUser)
+          .map((customer) => [
+            `${customer.type}:${customer.mikrotikUser}`.toLowerCase(),
+            customer,
+          ]),
+      );
+
+      const imported: any[] = [];
+      for (const user of users) {
+        const mikrotikUser = String(user?.name || '').trim();
+        if (!mikrotikUser) continue;
+        const key = `${normalizedType}:${mikrotikUser}`.toLowerCase();
+        const current = byUser.get(key);
+        const next = await this.billingService.saveCustomer({
+          ...(current || {}),
+          ...(current ? {} : { id: undefined }),
+          sessionId: session,
+          name: current?.name || mikrotikUser,
+          mikrotikUser,
+          type: normalizedType,
+          profile: String(user?.profile || current?.profile || '').trim(),
+          status: String(user?.disabled || '').toLowerCase() === 'yes' ? 'suspended' : (current?.status || 'active'),
+          note: current?.note || 'Imported from MikroTik',
+        });
+        byUser.set(key, next);
+        imported.push(next);
+      }
+
+      return {
+        success: true,
+        type: normalizedType,
+        total: users.length,
+        imported: imported.length,
+        users: imported,
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        type: normalizedType,
+        users: [],
+        message: error?.message || 'Gagal mengambil user dari router',
+      };
+    }
   }
 
   @Get('settlements')
@@ -193,19 +295,16 @@ export class BillingController {
     @Param('session') session: string,
     @Body() body: { collectorId?: string; collectorName?: string; amount?: number },
   ) {
-    if (!body.collectorId && !body.collectorName) {
-      return { success: false, error: 'Collector wajib dipilih' };
-    }
-    if (body.collectorId) {
-      const collector = await this.billingService.getCustomer(body.collectorId);
+    const collectorId = String(body?.collectorId || '').trim();
+    const collectorName = String(body?.collectorName || '').trim();
+    const amount = Number(body?.amount);
+    if (!collectorId && !collectorName) return { success: false, error: 'Collector wajib dipilih' };
+    if (!Number.isFinite(amount) || amount <= 0) return { success: false, error: 'Amount harus lebih besar dari 0' };
+    if (collectorId) {
+      const collector = await this.billingService.getCustomer(collectorId);
       if (!this.sessionMatches(collector, session)) return { success: false, error: 'Collector not found' };
     }
-    return this.billingService.submitSettlement(
-      session,
-      body.collectorId || '',
-      body.collectorName || '',
-      Number(body.amount) || 0,
-    );
+    return this.billingService.submitSettlement(session, collectorId, collectorName, amount);
   }
 
   @Patch('settlements/:id/verify')
@@ -213,36 +312,5 @@ export class BillingController {
     const settlements = await this.billingService.loadSettlements(session);
     if (!settlements.some((s) => s.id === id)) return { success: false };
     return { success: await this.billingService.verifySettlement(id) };
-  }
-
-  @Get('collector/:name')
-  async collector(@Param('session') session: string, @Param('name') name: string) {
-    const customers = await this.billingService.loadCustomers(session);
-    const collector = customers.find((c) => c.name === name);
-    if (!collector) return { error: 'Collector not found' };
-    return {
-      name: collector.name,
-      unsettledCash: collector.unsettledCash || 0,
-      history: (await this.billingService.loadSettlements(session)).filter((s) => s.collectorName === name),
-    };
-  }
-
-  @Get('settlement/summary/:collectorName')
-  async settlementSummary(@Param('session') session: string, @Param('collectorName') collectorName: string) {
-    const customers = await this.billingService.loadCustomers(session);
-    const collector = customers.find((c) => c.name === collectorName);
-    const history = (await this.billingService.loadSettlements(session)).filter((s) => s.collectorName === collectorName);
-    return {
-      success: true,
-      data: {
-        unsettled: collector?.unsettledCash || 0,
-        history: history.map((h) => ({
-          id: h.id,
-          date: new Date(h.createdAt).toLocaleDateString('id-ID'),
-          amount: h.amount,
-          status: h.status,
-        })),
-      },
-    };
   }
 }

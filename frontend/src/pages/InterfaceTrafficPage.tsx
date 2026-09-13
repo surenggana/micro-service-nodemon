@@ -1,0 +1,130 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Activity, Pause, Play, RefreshCw, Search } from "lucide-react";
+import { router } from "../api";
+import "../interface-traffic-page.css";
+
+type Row = Record<string, any>;
+type Props = { session: string };
+
+const textOf = (row: Row, keys: string[], fallback = "—") => {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== "") return String(row[key]);
+  }
+  return fallback;
+};
+
+export default function InterfaceTrafficPage({ session }: Props) {
+  const [interfaces, setInterfaces] = useState<Row[]>([]);
+  const [selected, setSelected] = useState("");
+  const [traffic, setTraffic] = useState<Row | null>(null);
+  const [query, setQuery] = useState("");
+  const [paused, setPaused] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const requestRef = useRef(0);
+
+  const loadInterfaces = async () => {
+    if (!session) return;
+    try {
+      const result = await router.interfaces(session);
+      const rows = Array.isArray(result) ? result : result?.interfaces || result?.data || [];
+      setInterfaces(rows);
+      setSelected((current) => {
+        const exists = current && rows.some((row: Row) => String(row.name || row.id || "") === current);
+        return exists ? current : String(rows[0]?.name || rows[0]?.id || "");
+      });
+    } catch (e: any) {
+      setInterfaces([]);
+      setSelected("");
+      setTraffic(null);
+      setNotice(e?.message || "Unable to load interfaces.");
+    }
+  };
+
+  const loadTraffic = async () => {
+    if (!session || !selected || paused) return;
+    const requestId = ++requestRef.current;
+    setBusy(true);
+    try {
+      const result = await router.interfaceTraffic(session, selected);
+      if (requestId !== requestRef.current) return;
+      setTraffic(result?.traffic || result?.data || result || null);
+      setNotice("");
+    } catch (e: any) {
+      if (requestId !== requestRef.current) return;
+      setNotice(e?.message || "Unable to load interface traffic.");
+    } finally {
+      if (requestId === requestRef.current) setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    requestRef.current += 1;
+    setInterfaces([]);
+    setSelected("");
+    setTraffic(null);
+    setNotice("");
+    setQuery("");
+    setPaused(false);
+    void loadInterfaces();
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || !selected) return;
+    void loadTraffic();
+    if (paused) return;
+    const timer = window.setInterval(() => void loadTraffic(), 5000);
+    return () => window.clearInterval(timer);
+  }, [session, selected, paused]);
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return !q ? interfaces : interfaces.filter((r) => Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q)));
+  }, [interfaces, query]);
+
+  const field = (keys: string[]) => textOf(traffic || {}, keys);
+  const selectedInVisible = selected && visible.some((row) => String(row.name || row.id || "") === selected);
+  const selectOptions = selected && !selectedInVisible ? [...interfaces.filter((row) => String(row.name || row.id || "") === selected), ...visible] : visible;
+
+  return (
+    <div className="stack interface-traffic-page">
+      <div className="hero">
+        <div>
+          <span className="eyebrow">LIVE TELEMETRY</span>
+          <h3>Interface Traffic</h3>
+          <p>Realtime RouterOS interface traffic with a 5-second refresh cycle.</p>
+        </div>
+        <div className="top-actions">
+          <button className="button" disabled={busy || !selected} onClick={() => void loadTraffic()}><RefreshCw size={15} className={busy ? "spin" : ""} /> Refresh</button>
+          <button className="button" disabled={!selected} onClick={() => setPaused((v) => !v)}>{paused ? <Play size={15} /> : <Pause size={15} />} {paused ? "Resume" : "Pause"}</button>
+        </div>
+      </div>
+      {notice && <div className="error banner">{notice}</div>}
+
+      <section className="panel traffic-monitor-panel">
+        <div className="panel-head">
+          <div><h3><Activity size={15} /> Interface Monitor</h3><span>{selected || "No interface selected"} · {paused ? "Paused" : "Live · 5s"}</span></div>
+          <span className="badge">{busy ? "WORKING" : paused ? "PAUSED" : "LIVE"}</span>
+        </div>
+        <div className="table-controls">
+          <div className="table-search"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search interface, type, MAC..." /></div>
+          <div className="panel-actions"><select value={selected} onChange={(e) => { setSelected(e.target.value); setTraffic(null); }}><option value="">— Select Interface —</option>{selectOptions.map((r, i) => <option key={String(r.name || r.id || i)} value={String(r.name || r.id || "")}>{r.name || r.id || `Interface ${i + 1}`}</option>)}</select></div>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>MAC Address</th><th>Status</th><th>TX</th><th>RX</th></tr></thead>
+            <tbody>{visible.map((r, i) => { const name = textOf(r, ["name", "id"], `interface-${i}`); const running = String(r.running).toLowerCase(); return <tr key={`${name}-${i}`} className={name === selected ? "active-row" : ""}><td><b>{name}</b></td><td>{textOf(r, ["type"])}</td><td>{textOf(r, ["macAddress", "mac_address"])}</td><td>{running === "true" ? "Yes" : running === "false" ? "No" : textOf(r, ["running"])}</td><td>{textOf(r, ["tx", "txRate", "tx_rate"])}</td><td>{textOf(r, ["rx", "rxRate", "rx_rate"])}</td></tr>; })}</tbody>
+          </table>
+          {!visible.length && <div className="empty">No interfaces found.</div>}
+        </div>
+      </section>
+
+      <section className="stats traffic-counters">
+        <div className="stat"><div className="stat-icon"><Activity size={18} /></div><div><span>TX Rate</span><strong>{field(["tx", "txRate", "tx_rate", "txBps"])}</strong></div><small>Current transmit rate</small></div>
+        <div className="stat"><div className="stat-icon"><Activity size={18} /></div><div><span>RX Rate</span><strong>{field(["rx", "rxRate", "rx_rate", "rxBps"])}</strong></div><small>Current receive rate</small></div>
+        <div className="stat"><div><span>Total TX</span><strong>{field(["txBytes", "tx_bytes", "bytesOut"])}</strong></div><small>Cumulative bytes out</small></div>
+        <div className="stat"><div><span>Total RX</span><strong>{field(["rxBytes", "rx_bytes", "bytesIn"])}</strong></div><small>Cumulative bytes in</small></div>
+      </section>
+    </div>
+  );
+}

@@ -5,6 +5,22 @@ import { BillingCustomerEntity } from '../entities/billing-customer.entity';
 import { BillingInvoiceEntity } from '../entities/billing-invoice.entity';
 import { BillingSettlementEntity } from '../entities/billing-settlement.entity';
 
+export interface ReminderClaim {
+  claimed: boolean;
+  token?: string;
+}
+
+export interface PaymentReenableResult {
+  invoice: BillingInvoiceEntity;
+  customerReenabled: boolean;
+}
+
+export interface OverdueNotificationClaim {
+  claimed: boolean;
+  token?: string;
+  invoiceId?: string;
+}
+
 @Injectable()
 export class BillingService {
   private readonly logger = new Logger(BillingService.name);
@@ -43,6 +59,17 @@ export class BillingService {
     return this.customerRepo.find({ where: { sessionId }, order: { name: 'ASC' } });
   }
 
+  async listReminderSessions(): Promise<string[]> {
+    const rows = await this.customerRepo
+      .createQueryBuilder('customer')
+      .select('customer.sessionId', 'sessionId')
+      .where('customer.sessionId IS NOT NULL')
+      .andWhere("customer.sessionId <> ''")
+      .distinct(true)
+      .getRawMany<{ sessionId: string }>();
+    return rows.map((row) => String(row.sessionId || '').trim()).filter(Boolean);
+  }
+
   async getCustomer(id: string): Promise<BillingCustomerEntity | null> {
     return this.customerRepo.findOne({ where: { id } });
   }
@@ -73,7 +100,6 @@ export class BillingService {
     return this.invoiceRepo.findOne({ where: { id } });
   }
 
-  /** Calculate the next billing date, preserving the monolith's billDate rule. */
   calcDueDate(billDate: number): string {
     const now = new Date();
     const day = Math.min(Math.max(Number(billDate) || 1, 1), 28);
@@ -82,16 +108,9 @@ export class BillingService {
     return due.toISOString().slice(0, 10);
   }
 
-  async createInvoice(
-    customer: BillingCustomerEntity,
-    period?: string,
-    dueDate?: string,
-  ): Promise<BillingInvoiceEntity> {
+  async createInvoice(customer: BillingCustomerEntity, period?: string, dueDate?: string): Promise<BillingInvoiceEntity> {
     const now = new Date();
-    const months = [
-      'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-      'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
-    ];
+    const months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
     const p = period || `${months[now.getMonth()]} ${now.getFullYear()}`;
     const entity = this.invoiceRepo.create({
       sessionId: customer.sessionId,
@@ -112,16 +131,11 @@ export class BillingService {
   async generateMonthlyInvoices(sessionId: string): Promise<{ success: boolean; count: number }> {
     const customers = (await this.loadCustomers(sessionId)).filter((c) => c.status === 'active');
     const now = new Date();
-    const months = [
-      'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-      'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
-    ];
+    const months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
     const period = `${months[now.getMonth()]} ${now.getFullYear()}`;
     let count = 0;
     for (const customer of customers) {
-      const exists = await this.invoiceRepo.findOne({
-        where: { sessionId, customerId: customer.id, period },
-      });
+      const exists = await this.invoiceRepo.findOne({ where: { sessionId, customerId: customer.id, period } });
       if (exists) continue;
       await this.createInvoice(customer, period);
       count++;
@@ -142,9 +156,7 @@ export class BillingService {
   }
 
   async trackCollectorCash(inv: BillingInvoiceEntity, collectorName: string): Promise<void> {
-    const collectors = await this.customerRepo.find({
-      where: { sessionId: inv.sessionId, name: collectorName },
-    });
+    const collectors = await this.customerRepo.find({ where: { sessionId: inv.sessionId, name: collectorName } });
     for (const collector of collectors) {
       collector.unsettledCash = Number(collector.unsettledCash || 0) + Number(inv.amount || 0);
       await this.customerRepo.save(collector);
@@ -159,14 +171,11 @@ export class BillingService {
     return Math.round((due.getTime() - now.getTime()) / 86400000);
   }
 
-  async getOverdueCustomers(
-    sessionId: string,
-  ): Promise<{ customer: BillingCustomerEntity; invoice: BillingInvoiceEntity }[]> {
+  async getOverdueCustomers(sessionId: string): Promise<{ customer: BillingCustomerEntity; invoice: BillingInvoiceEntity }[]> {
     const customers = await this.loadCustomers(sessionId);
     const customerMap = new Map(customers.map((c) => [c.id, c]));
     const invoices = await this.invoiceRepo.find({ where: { sessionId, status: 'unpaid' } });
     const result: { customer: BillingCustomerEntity; invoice: BillingInvoiceEntity }[] = [];
-
     for (const invoice of invoices) {
       const customer = customerMap.get(invoice.customerId);
       if (!customer || customer.autoDisable === false || !invoice.dueDate) continue;
@@ -179,44 +188,30 @@ export class BillingService {
     return result;
   }
 
-  async flagOverdueInvoices(
-    sessionId: string,
-  ): Promise<{ count: number; customers: BillingCustomerEntity[] }> {
+  async flagOverdueInvoices(sessionId: string): Promise<{ count: number; customers: BillingCustomerEntity[] }> {
     const overdue = await this.getOverdueCustomers(sessionId);
     const seen = new Set<string>();
     const customers: BillingCustomerEntity[] = [];
     for (const { invoice, customer } of overdue) {
-      // getOverdueCustomers already marks the invoice overdue; keep this
-      // method responsible only for the controller-facing aggregate contract.
       if (!seen.has(customer.id)) {
         seen.add(customer.id);
         customers.push(customer);
       }
-      // Keep the explicit update for compatibility if the implementation of
-      // getOverdueCustomers changes later.
-      if (invoice.status !== 'overdue') {
-        await this.invoiceRepo.update({ id: invoice.id }, { status: 'overdue' });
-      }
+      if (invoice.status !== 'overdue') await this.invoiceRepo.update({ id: invoice.id }, { status: 'overdue' });
     }
     return { count: overdue.length, customers };
   }
 
-  /** Find unpaid invoices whose configured reminder day has arrived. */
-  async getRemindableInvoices(
-    sessionId: string,
-  ): Promise<{ customer: BillingCustomerEntity; invoice: BillingInvoiceEntity; daysLeft: number }[]> {
+  async getRemindableInvoices(sessionId: string): Promise<{ customer: BillingCustomerEntity; invoice: BillingInvoiceEntity; daysLeft: number }[]> {
     const customers = await this.loadCustomers(sessionId);
     const customerMap = new Map(customers.map((c) => [c.id, c]));
     const invoices = await this.invoiceRepo.find({ where: { sessionId, status: 'unpaid' } });
     const today = new Date().toISOString().slice(0, 10);
     const result: { customer: BillingCustomerEntity; invoice: BillingInvoiceEntity; daysLeft: number }[] = [];
-
     for (const invoice of invoices) {
       const customer = customerMap.get(invoice.customerId);
       if (!customer?.telegramId || !invoice.dueDate) continue;
-      const reminderDays = Array.isArray(customer.reminderDays) && customer.reminderDays.length
-        ? customer.reminderDays
-        : [7, 3, 1];
+      const reminderDays = Array.isArray(customer.reminderDays) && customer.reminderDays.length ? customer.reminderDays : [7, 3, 1];
       const daysLeft = this.getDaysUntilDue(invoice.dueDate);
       if (!reminderDays.includes(daysLeft)) continue;
       const sentToday = (invoice.reminderSent || []).some((sent) => String(sent).startsWith(today));
@@ -225,62 +220,136 @@ export class BillingService {
     return result;
   }
 
+  async claimReminder(invoiceId: string): Promise<ReminderClaim> {
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoice = await manager.findOne(BillingInvoiceEntity, { where: { id: invoiceId }, lock: { mode: 'pessimistic_write' } });
+      if (!invoice) return { claimed: false };
+      const today = new Date().toISOString().slice(0, 10);
+      const sent = Array.isArray(invoice.reminderSent) ? invoice.reminderSent : [];
+      if (sent.some((value) => {
+        const text = String(value);
+        return text.startsWith(today) || text.startsWith('__claim__:' + today);
+      })) return { claimed: false };
+      const token = `__claim__:${today}:${crypto.randomUUID()}`;
+      invoice.reminderSent = [...sent, token];
+      await manager.save(invoice);
+      return { claimed: true, token };
+    });
+  }
+
+  async confirmReminderClaim(invoiceId: string, token: string): Promise<boolean> {
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoice = await manager.findOne(BillingInvoiceEntity, { where: { id: invoiceId }, lock: { mode: 'pessimistic_write' } });
+      if (!invoice) return false;
+      const sent = Array.isArray(invoice.reminderSent) ? invoice.reminderSent : [];
+      const index = sent.findIndex((value) => String(value) === token);
+      if (index < 0) return false;
+      const next = [...sent];
+      next[index] = new Date().toISOString();
+      invoice.reminderSent = next;
+      await manager.save(invoice);
+      return true;
+    });
+  }
+
+  async rollbackReminderClaim(invoiceId: string, token: string): Promise<boolean> {
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoice = await manager.findOne(BillingInvoiceEntity, { where: { id: invoiceId }, lock: { mode: 'pessimistic_write' } });
+      if (!invoice) return false;
+      const sent = Array.isArray(invoice.reminderSent) ? invoice.reminderSent : [];
+      const next = sent.filter((value) => String(value) !== token);
+      if (next.length === sent.length) return false;
+      invoice.reminderSent = next;
+      await manager.save(invoice);
+      return true;
+    });
+  }
+
   async markReminderSent(id: string): Promise<void> {
-    const invoice = await this.getInvoice(id);
-    if (!invoice) return;
-    const today = new Date().toISOString().slice(0, 10);
-    const sent = Array.isArray(invoice.reminderSent) ? invoice.reminderSent : [];
-    if (sent.some((value) => String(value).startsWith(today))) return;
-    invoice.reminderSent = [...sent, new Date().toISOString()];
-    await this.invoiceRepo.save(invoice);
+    const claim = await this.claimReminder(id);
+    if (claim.claimed && claim.token) await this.confirmReminderClaim(id, claim.token);
+  }
+
+  async claimOverdueNotification(customerId: string): Promise<OverdueNotificationClaim> {
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoices = await manager.find(BillingInvoiceEntity, {
+        where: { customerId, status: 'overdue' },
+        order: { createdAt: 'ASC' },
+      });
+      const today = new Date().toISOString().slice(0, 10);
+      for (const invoice of invoices) {
+        const sent = Array.isArray(invoice.overdueNotificationSent) ? invoice.overdueNotificationSent : [];
+        if (sent.some((value) => String(value).startsWith(today))) continue;
+        const token = `__overdue_claim__:${today}:${crypto.randomUUID()}`;
+        invoice.overdueNotificationSent = [...sent, token];
+        await manager.save(invoice);
+        return { claimed: true, token, invoiceId: invoice.id };
+      }
+      return { claimed: false };
+    });
+  }
+
+  async confirmOverdueNotification(customerId: string, token?: string): Promise<boolean> {
+    if (!token) return false;
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoices = await manager.find(BillingInvoiceEntity, {
+        where: { customerId, status: 'overdue' },
+        order: { createdAt: 'ASC' },
+      });
+      for (const invoice of invoices) {
+        const sent = Array.isArray(invoice.overdueNotificationSent) ? invoice.overdueNotificationSent : [];
+        const index = sent.findIndex((value) => String(value) === token);
+        if (index < 0) continue;
+        const next = [...sent];
+        next[index] = new Date().toISOString();
+        invoice.overdueNotificationSent = next;
+        await manager.save(invoice);
+        return true;
+      }
+      return false;
+    });
+  }
+
+  async rollbackOverdueNotification(customerId: string, token?: string): Promise<boolean> {
+    if (!token) return false;
+    return this.invoiceRepo.manager.transaction(async (manager) => {
+      const invoices = await manager.find(BillingInvoiceEntity, {
+        where: { customerId, status: 'overdue' },
+        order: { createdAt: 'ASC' },
+      });
+      for (const invoice of invoices) {
+        const sent = Array.isArray(invoice.overdueNotificationSent) ? invoice.overdueNotificationSent : [];
+        const next = sent.filter((value) => String(value) !== token);
+        if (next.length === sent.length) continue;
+        invoice.overdueNotificationSent = next;
+        await manager.save(invoice);
+        return true;
+      }
+      return false;
+    });
   }
 
   async loadSettlements(sessionId: string): Promise<BillingSettlementEntity[]> {
     return this.settlementRepo.find({ where: { sessionId }, order: { createdAt: 'DESC' } });
   }
 
-  async submitSettlement(
-    sessionId: string,
-    collectorId: string,
-    collectorName: string,
-    amount: number,
-  ): Promise<BillingSettlementEntity> {
+  async submitSettlement(sessionId: string, collectorId: string, collectorName: string, amount: number): Promise<BillingSettlementEntity> {
     const normalizedAmount = Number(amount) || 0;
-    const entity = this.settlementRepo.create({
-      sessionId,
-      collectorId: collectorId || '',
-      collectorName: collectorName || '',
-      amount: normalizedAmount,
-      status: 'pending',
-    });
-    // Do not clear unsettledCash here. Submission is only a request; the
-    // monolith clears the collector balance after verification.
+    const entity = this.settlementRepo.create({ sessionId, collectorId: collectorId || '', collectorName: collectorName || '', amount: normalizedAmount, status: 'pending' });
     return this.settlementRepo.save(entity);
   }
 
   async verifySettlement(id: string): Promise<boolean> {
     const settlement = await this.settlementRepo.findOne({ where: { id } });
     if (!settlement) return false;
-    // Idempotency: a second verify request must not deduct the collector twice.
     if (settlement.status === 'verified') return true;
-
     settlement.status = 'verified';
     settlement.verifiedAt = new Date().toISOString();
     await this.settlementRepo.save(settlement);
-
-    let collector = settlement.collectorId
-      ? await this.customerRepo.findOne({ where: { id: settlement.collectorId } })
-      : null;
-    if (!collector && settlement.collectorName) {
-      collector = (await this.customerRepo.find({
-        where: { sessionId: settlement.sessionId, name: settlement.collectorName },
-      }))[0] || null;
-    }
+    let collector = settlement.collectorId ? await this.customerRepo.findOne({ where: { id: settlement.collectorId } }) : null;
+    if (!collector && settlement.collectorName) collector = (await this.customerRepo.find({ where: { sessionId: settlement.sessionId, name: settlement.collectorName } }))[0] || null;
     if (collector) {
-      collector.unsettledCash = Math.max(
-        0,
-        Number(collector.unsettledCash || 0) - Number(settlement.amount || 0),
-      );
+      collector.unsettledCash = Math.max(0, Number(collector.unsettledCash || 0) - Number(settlement.amount || 0));
       await this.customerRepo.save(collector);
     }
     return true;
@@ -289,7 +358,6 @@ export class BillingService {
   async getUnsettledAmount(collectorId: string): Promise<number> {
     const invoices = await this.invoiceRepo.find({ where: { paidBy: collectorId, status: 'paid' } });
     const settlements = await this.settlementRepo.find({ where: { collectorId, status: 'verified' } });
-    return invoices.reduce((sum, i) => sum + Number(i.amount || 0), 0)
-      - settlements.reduce((sum, s) => sum + Number(s.amount || 0), 0);
+    return invoices.reduce((sum, i) => sum + Number(i.amount || 0), 0) - settlements.reduce((sum, s) => sum + Number(s.amount || 0), 0);
   }
 }

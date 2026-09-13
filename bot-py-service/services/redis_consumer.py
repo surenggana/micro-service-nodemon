@@ -2,9 +2,10 @@
 
 Consumes:
   payment.order.settled  → deliver voucher via WA/TG (and notify admin)
-  payment.order.paid     → admin notification (optional)
-  payment.failed         → admin alert
-  billing.invoice.overdue → reminder (stub)
+  payment.order.paid     → Telegram sale/admin notification
+  payment.failed         → Telegram admin alert
+  billing.invoice.overdue → Telegram billing alert
+  billing.invoice.reminder → targeted Telegram customer reminder
 
 Port of the logic triggered by the monolith's settlement flow,
 but now driven by async events rather than in-process method calls.
@@ -26,6 +27,7 @@ from config import (
     WA_DEFAULT_DOMAIN,
 )
 from services.notifier import send_voucher_wa
+from services import tg_notifier
 
 log = logging.getLogger("bot-py-service.redis-consumer")
 
@@ -57,20 +59,17 @@ class RedisConsumer:
 
         use_streams = os.getenv("USE_REDIS_STREAMS", "true").lower() == "true"
         if use_streams:
-            # Use consumer groups on Redis Streams for reliable delivery.
             group = os.getenv("REDIS_STREAM_GROUP", "bot-group")
             consumer = f"bot-{os.getpid()}"
-            # Ensure groups exist for each stream.
             for stream in self.topics:
                 try:
                     r.xgroup_create(stream, group, id="$", mkstream=True)
                 except redis.exceptions.ResponseError:
-                    # Group already exists
                     pass
 
             last_recovery = 0.0
-            recovery_interval = 30  # seconds
-            stale_after_ms = 60_000  # min idle time before we reclaim a PEL entry
+            recovery_interval = 30
+            stale_after_ms = 60_000
 
             while self._running:
                 try:
@@ -80,7 +79,6 @@ class RedisConsumer:
                             self._claim_stale_pending(r, s, group, consumer, stale_after_ms)
                         last_recovery = now
 
-                    # Read new messages from all streams (use '>' to get new entries)
                     resp = r.xreadgroup(groupname=group, consumername=consumer, streams={s: '>' for s in self.topics}, count=10, block=5000)
                     if not resp:
                         continue
@@ -92,12 +90,6 @@ class RedisConsumer:
                                 payload = json.loads(raw)
                             except (TypeError, json.JSONDecodeError):
                                 payload = {"raw": raw}
-                            # Only ack on success. Acking unconditionally was
-                            # the bug: a failed handler (e.g. Fonnte down)
-                            # still had its message marked delivered, so the
-                            # notification was silently dropped instead of
-                            # retried — exactly the guarantee streams were
-                            # meant to add over plain pub/sub.
                             if self._dispatch(stream_name, payload):
                                 try:
                                     r.xack(stream, group, entry_id)
@@ -110,7 +102,6 @@ class RedisConsumer:
                     time.sleep(1)
             return
 
-        # Fallback: legacy Pub/Sub
         pubsub = r.pubsub()
         pubsub.subscribe(*self.topics)
         for msg in pubsub.listen():
@@ -127,9 +118,7 @@ class RedisConsumer:
 
     def _dispatch(self, topic: str, payload: dict) -> bool:
         """Run the handler for `topic`. Returns True iff the event was fully
-        handled and is safe to XACK. False (or a raised exception, which is
-        treated as False) means the caller should leave the message pending
-        so it gets retried instead of silently lost.
+        handled and is safe to XACK. False means the message stays pending.
         """
         log.info(f"[event] {topic} -> {json.dumps(payload, default=str)[:200]}")
         try:
@@ -141,7 +130,8 @@ class RedisConsumer:
                 return self._handle_payment_failed(payload)
             elif topic == "billing.invoice.overdue":
                 return self._handle_invoice_overdue(payload)
-            # Unknown topic: nothing to retry, ack it so it doesn't pile up.
+            elif topic == "billing.invoice.reminder":
+                return self._handle_invoice_reminder(payload)
             return True
         except Exception as e:
             log.error(f"[event] handler for {topic} failed: {e}")
@@ -161,27 +151,41 @@ class RedisConsumer:
                 f"[VOUCHER] {voucher_name} → {username}/{password} (no phone — "
                 f"customer must contact admin for credentials)"
             )
-            return True
+        else:
+            if not send_voucher_wa(
+                {
+                    "phone": phone,
+                    "voucherName": voucher_name,
+                    "username": username,
+                    "password": password,
+                    "profile": profile,
+                    "validity": validity,
+                },
+                wa_provider=WA_DEFAULT_PROVIDER,
+                wa_token=WA_DEFAULT_TOKEN,
+                wa_domain=WA_DEFAULT_DOMAIN,
+            ):
+                return False
 
-        return send_voucher_wa(
-            {
-                "phone": phone,
-                "voucherName": voucher_name,
-                "username": username,
-                "password": password,
-                "profile": profile,
-                "validity": validity,
-            },
-            wa_provider=WA_DEFAULT_PROVIDER,
-            wa_token=WA_DEFAULT_TOKEN,
-            wa_domain=WA_DEFAULT_DOMAIN,
-        )
+        try:
+            delivered = tg_notifier.notify_sale(payload)
+            if delivered is False:
+                log.warning("[TG] sale notification returned failure")
+                return False
+        except Exception as exc:
+            log.warning(f"[TG] sale notification failed: {exc}")
+            return False
+        return True
 
     def _handle_order_paid(self, payload: dict) -> bool:
-        """Order paid event (can be used for admin notifications / stock updates)."""
-        # Admin notifications for this flow also go out via the monolith's
-        # notifier (PayhookNotifierService) as a fallback. Here we just log
-        # and optionally forward to the configured Telegram admin chat.
+        """Notify enabled Telegram admin bots when an order is paid."""
+        try:
+            delivered = tg_notifier.notify_sale(payload)
+            if delivered is False:
+                return False
+        except Exception as exc:
+            log.warning(f"[TG] paid notification failed: {exc}")
+            return False
         order_id = payload.get("orderId", "")
         amount = payload.get("uniqueAmount", 0)
         profile = payload.get("profile", "")
@@ -189,24 +193,47 @@ class RedisConsumer:
         return True
 
     def _handle_payment_failed(self, payload: dict) -> bool:
+        try:
+            delivered = tg_notifier.notify_payment_failed(payload)
+            if delivered is False:
+                return False
+        except Exception as exc:
+            log.warning(f"[TG] failure notification failed: {exc}")
+            return False
         order_id = payload.get("orderId", "")
         reason = payload.get("reason", "unknown")
         log.warning(f"[FAILED] Order {order_id}: {reason}")
         return True
 
     def _handle_invoice_overdue(self, payload: dict) -> bool:
+        try:
+            delivered = tg_notifier.notify_invoice_overdue(payload)
+            if delivered is False:
+                return False
+        except Exception as exc:
+            log.warning(f"[TG] overdue notification failed: {exc}")
+            return False
         invoice_id = payload.get("invoiceId", "")
         customer = payload.get("customerId", "")
         log.warning(f"[OVERDUE] Invoice {invoice_id} for customer {customer}")
         return True
 
+    def _handle_invoice_reminder(self, payload: dict) -> bool:
+        """Deliver a targeted billing reminder to the subscriber."""
+        try:
+            delivered = tg_notifier.notify_invoice_reminder(payload)
+            if not delivered:
+                log.warning(
+                    "[TG] billing reminder could not be delivered for invoice %s",
+                    payload.get("invoiceId", ""),
+                )
+                return False
+            return True
+        except Exception as exc:
+            log.warning(f"[TG] billing reminder failed: {exc}")
+            return False
+
     def _claim_stale_pending(self, r, stream: str, group: str, consumer: str, min_idle_ms: int):
-        """Reclaim and reprocess PEL entries idle longer than min_idle_ms —
-        covers both a consumer that died mid-handler (its messages would
-        otherwise sit in the PEL forever, since XREADGROUP '>' only returns
-        never-delivered entries) and the retry case from the ack-on-failure
-        fix above.
-        """
         start = "-"
         while True:
             try:

@@ -13,6 +13,7 @@ import {
  * the payment service.
  */
 @Entity('billing_invoices')
+@Index(['sessionId', 'customerId', 'period'], { unique: true })
 export class BillingInvoiceEntity {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -61,6 +62,10 @@ export class BillingInvoiceEntity {
   /** ISO timestamps of reminders sent; kept as an array for daily idempotency. */
   @Column({ type: 'simple-json', nullable: true })
   reminderSent: string[];
+
+  /** ISO timestamps when the invoice was automatically suspended/processed. */
+  @Column({ type: 'simple-json', nullable: true })
+  overdueNotificationSent: string[];
 
   @CreateDateColumn()
   createdAt: string;
